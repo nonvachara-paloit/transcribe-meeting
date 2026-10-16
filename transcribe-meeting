@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Create timestamped meeting transcripts locally.
+
+Uses mlx-whisper (Metal GPU) on Apple silicon and faster-whisper (CPU) elsewhere.
+
+Usage:
+  ./transcribe-meeting recording.m4a
+  ./transcribe-meeting recording.mp3 --model small --output-dir ./transcripts
+  ./transcribe-meeting recording.mp3 --engine faster-whisper
+  ./transcribe-meeting recording.mp3 --engine crisperwhisper --model large
+"""
+
+import argparse
+import os
+import platform
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+START = time.monotonic()
+
+
+def elapsed():
+    seconds = int(time.monotonic() - START)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
+def _reexec_in_local_venv():
+    """Use the venv next to this script when launched outside any virtualenv."""
+    if sys.prefix != sys.base_prefix or os.environ.get("VIRTUAL_ENV"):
+        return
+    venv_python = Path(__file__).resolve().parent / "venv" / "bin" / "python"
+    if venv_python.is_file():
+        os.execv(str(venv_python), [str(venv_python), *sys.argv])
+
+
+_reexec_in_local_venv()
+
+
+def is_apple_silicon():
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def missing_dependency(package):
+    print(
+        f"Missing dependency {package!r}. Install it into the active environment with:\n"
+        f"  {sys.executable} -m pip install {package}\n",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+def timestamp(seconds):
+    minutes, seconds = divmod(int(seconds), 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def mlx_repo(model):
+    if "/" in model:
+        return model
+    if model in ("turbo", "large-v3-turbo"):
+        return "mlx-community/whisper-large-v3-turbo"
+    return f"mlx-community/whisper-{model}-mlx"
+
+
+def transcribe_mlx(args):
+    try:
+        import mlx_whisper
+    except ImportError:
+        missing_dependency("mlx-whisper")
+
+    repo = mlx_repo(args.model)
+    print(f"Transcribing with mlx-whisper ({repo}, Metal GPU)…", file=sys.stderr)
+    # verbose=False makes mlx-whisper draw its own progress bar on stderr.
+    result = mlx_whisper.transcribe(
+        str(args.audio),
+        path_or_hf_repo=repo,
+        language=args.language,
+        verbose=False,
+        condition_on_previous_text=True,
+    )
+    collected = [(s["start"], s["end"], s["text"].strip()) for s in result["segments"]]
+    return collected, f"Language detected: {result.get('language', 'unknown')}"
+
+
+def transcribe_faster_whisper(args):
+    try:
+        import av
+        from faster_whisper import WhisperModel
+        import faster_whisper.audio as whisper_audio
+    except ImportError:
+        missing_dependency("faster-whisper")
+
+    # Some PyAV releases do not recognise metadata_errors; retry without it.
+    original_open = av.open
+
+    def compatible_open(*a, **kw):
+        try:
+            return original_open(*a, **kw)
+        except TypeError as error:
+            if "metadata_errors" not in str(error):
+                raise
+            kw.pop("metadata_errors", None)
+            return original_open(*a, **kw)
+
+    whisper_audio.av.open = compatible_open
+
+    print(f"Loading {args.model!r} model (faster-whisper, CPU)…", file=sys.stderr)
+    model = WhisperModel(args.model, device="cpu", compute_type="int8")
+    print("Transcribing…", file=sys.stderr)
+    segments, info = model.transcribe(
+        str(args.audio),
+        beam_size=5,
+        vad_filter=True,
+        language=args.language,
+        condition_on_previous_text=True,
+    )
+
+    collected = []
+    total = info.duration or 0
+    for segment in segments:
+        collected.append((segment.start, segment.end, segment.text.strip()))
+        if total:
+            percent = min(100, segment.end / total * 100)
+            print(
+                f"\rProgress: {percent:5.1f}% ({timestamp(segment.end)} / {timestamp(total)}) | elapsed {elapsed()}",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+    print(file=sys.stderr)
+    return collected, f"Language detected: {info.language} ({info.language_probability:.0%} confidence)"
+
+
+CRISPER_MODELS = ("large", "turbo", "medium", "small")
+
+
+def transcribe_crisperwhisper(args):
+    try:
+        from crisperwhisper import CrisperWhisperModel
+    except ImportError:
+        missing_dependency("crisperwhisper[transformers]")
+
+    size = args.model
+    if size not in CRISPER_MODELS:
+        raise SystemExit(
+            f"CrisperWhisper model must be one of {', '.join(CRISPER_MODELS)} (Pro models are not supported), got {size!r}"
+        )
+    print(f"Transcribing with CrisperWhisper 2.0 ({size})…", file=sys.stderr)
+    # The default ct2 backend needs CUDA for float16; use torch (MPS) on Apple silicon, int8 CPU otherwise.
+    if is_apple_silicon():
+        model = CrisperWhisperModel(size, backend="transformers", device="mps", compute_type="float16")
+    else:
+        model = CrisperWhisperModel(size, device="cpu", compute_type="int8")
+    # libsndfile cannot read m4a/mp4 etc., so decode with ffmpeg to 16 kHz mono.
+    try:
+        import numpy as np
+        pcm = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(args.audio), "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except FileNotFoundError:
+        raise SystemExit("ffmpeg is required to decode audio (brew install ffmpeg).")
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"ffmpeg failed to decode {args.audio}:\n{error.stderr.decode(errors='replace')}")
+    audio = np.frombuffer(pcm, dtype=np.float32)
+
+    # The library has no progress hook: count completed primary decodes, not retry feature extraction.
+    import logging
+    state = {"done": 0, "total": 0}
+
+    def show_progress():
+        if state["total"]:
+            print(f"\rChunks: {state['done']}/{state['total']} | elapsed {elapsed()}", end="", file=sys.stderr, flush=True)
+
+    class ChunkCount(logging.Handler):
+        def emit(self, record):
+            if str(record.msg).startswith("Continuation longform"):
+                state["total"] = int(record.args[2])
+                show_progress()
+
+    longform_log = logging.getLogger("crisperwhisper.longform.continuation")
+    longform_log.addHandler(ChunkCount())
+    longform_log.setLevel(logging.INFO)
+    longform_log.propagate = False
+
+    engine = model._engine
+    for method_name in ("generate_with_attention", "generate_with_repair_and_attention"):
+        if hasattr(engine, method_name):
+            original = getattr(engine, method_name)
+
+            def counted_generate(*call_args, _original=original, **call_kwargs):
+                result = _original(*call_args, **call_kwargs)
+                state["done"] += 1
+                show_progress()
+                return result
+
+            setattr(engine, method_name, counted_generate)
+
+    result = model.transcribe(audio, sr=16000, language=args.language, word_timestamps=True)
+    print(file=sys.stderr)
+
+    # Group word timings into segments, splitting on pauses, sentence ends or length.
+    collected, words = [], []
+    for word in result.words:
+        if words and (word.start - words[-1].end > 0.8 or len(words) >= 20 or words[-1].word.rstrip().endswith((".", "?", "!"))):
+            collected.append((words[0].start, words[-1].end, " ".join(w.word.strip() for w in words)))
+            words = []
+        words.append(word)
+    if words:
+        collected.append((words[0].start, words[-1].end, " ".join(w.word.strip() for w in words)))
+    return collected, f"Language: {args.language or 'auto'} (CrisperWhisper 2.0 {size}, verbatim)"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Transcribe a meeting recording locally.")
+    parser.add_argument("audio", type=Path, help="Audio or video recording to transcribe")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Whisper model name, e.g. small, medium, large-v3, turbo (default: medium). "
+        "With mlx a full Hugging Face repo id is also accepted. "
+        "With crisperwhisper: large, turbo, medium, small (default: large).",
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path("."), help="Where transcripts are saved")
+    parser.add_argument("--language", help="Optional language code, such as en")
+    parser.add_argument(
+        "--engine",
+        choices=("auto", "mlx", "faster-whisper", "crisperwhisper"),
+        default="auto",
+        help="auto = mlx-whisper on Apple silicon, faster-whisper (CPU) otherwise",
+    )
+    args = parser.parse_args()
+
+    if not args.audio.is_file():
+        parser.error(f"Recording not found: {args.audio}")
+
+    engine = args.engine
+    if engine == "auto":
+        engine = "mlx" if is_apple_silicon() else "faster-whisper"
+    elif engine == "mlx" and not is_apple_silicon():
+        parser.error("--engine mlx requires an Apple silicon Mac")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.model is None:
+        args.model = "large" if engine == "crisperwhisper" else "medium"
+
+    run = {
+        "mlx": transcribe_mlx,
+        "faster-whisper": transcribe_faster_whisper,
+        "crisperwhisper": transcribe_crisperwhisper,
+    }[engine]
+    collected, language_line = run(args)
+
+    stem = args.audio.stem
+    raw_path = args.output_dir / f"{stem} transcript.txt"
+    readable_path = args.output_dir / f"{stem} transcript - readable.txt"
+    heading = [f"{stem} — Meeting Transcript", language_line, ""]
+    raw_path.write_text(
+        "\n".join(heading + [f"[{timestamp(start)}–{timestamp(end)}] {text}" for start, end, text in collected]) + "\n",
+        encoding="utf-8",
+    )
+
+    paragraphs, start, end, parts = [], None, None, []
+    for segment_start, segment_end, text in collected:
+        if start is None or segment_start - end > 3 or segment_end - start >= 35:
+            if parts:
+                paragraphs.append((start, end, " ".join(parts)))
+            start, parts = segment_start, []
+        end = segment_end
+        parts.append(text)
+    if parts:
+        paragraphs.append((start, end, " ".join(parts)))
+    readable_path.write_text(
+        "\n".join(heading + [f"[{timestamp(start)}–{timestamp(end)}] {text}\n" for start, end, text in paragraphs]),
+        encoding="utf-8",
+    )
+    print(f"Created:\n  {readable_path}\n  {raw_path}")
+    print(f"Total time: {elapsed()}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Create timestamped meeting transcripts with faster-whisper.
+
+Usage:
+  ./transcribe-meeting recording.m4a
+  ./transcribe-meeting recording.mp3 --model small --output-dir ./transcripts
+"""
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+try:
+    import av
+    from faster_whisper import WhisperModel
+    import faster_whisper.audio as whisper_audio
+except ImportError:
+    print(
+        "Missing dependency. Install it once with:\n"
+        "  python3 -m pip install faster-whisper\n",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+# Some PyAV releases do not recognise metadata_errors. Retry without it so the
+# command works across both old and new PyAV versions.
+_av_open = av.open
+
+def _compatible_av_open(*args, **kwargs):
+    try:
+        return _av_open(*args, **kwargs)
+    except TypeError as error:
+        if "metadata_errors" not in str(error):
+            raise
+        kwargs.pop("metadata_errors", None)
+        return _av_open(*args, **kwargs)
+
+
+whisper_audio.av.open = _compatible_av_open
+
+
+def timestamp(seconds):
+    minutes, seconds = divmod(int(seconds), 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Transcribe a meeting recording locally.")
+    parser.add_argument("audio", type=Path, help="Audio or video recording to transcribe")
+    parser.add_argument("--model", default="medium", help="Whisper model (default: medium)")
+    parser.add_argument("--output-dir", type=Path, default=Path("."), help="Where transcripts are saved")
+    parser.add_argument("--language", help="Optional language code, such as en")
+    args = parser.parse_args()
+
+    if not args.audio.is_file():
+        parser.error(f"Recording not found: {args.audio}")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # Keep models beside the outputs rather than using a hidden home-directory cache.
+    os.environ.setdefault("HF_HOME", str(args.output_dir / ".whisper-model-cache"))
+
+    print(f"Loading {args.model!r} model…", file=sys.stderr)
+    model = WhisperModel(args.model, device="cpu", compute_type="int8")
+    print("Transcribing…", file=sys.stderr)
+    segments, info = model.transcribe(
+        str(args.audio),
+        beam_size=5,
+        vad_filter=True,
+        language=args.language,
+        condition_on_previous_text=True,
+    )
+
+    collected = [(segment.start, segment.end, segment.text.strip()) for segment in segments]
+    stem = args.audio.stem
+    raw_path = args.output_dir / f"{stem} transcript.txt"
+    readable_path = args.output_dir / f"{stem} transcript - readable.txt"
+    heading = [
+        f"{stem} — Meeting Transcript",
+        f"Language detected: {info.language} ({info.language_probability:.0%} confidence)",
+        "",
+    ]
+    raw_path.write_text(
+        "\n".join(heading + [f"[{timestamp(start)}–{timestamp(end)}] {text}" for start, end, text in collected]) + "\n",
+        encoding="utf-8",
+    )
+
+    paragraphs, start, end, parts = [], None, None, []
+    for segment_start, segment_end, text in collected:
+        if start is None or segment_start - end > 3 or segment_end - start >= 35:
+            if parts:
+                paragraphs.append((start, end, " ".join(parts)))
+            start, parts = segment_start, []
+        end = segment_end
+        parts.append(text)
+    if parts:
+        paragraphs.append((start, end, " ".join(parts)))
+    readable_path.write_text(
+        "\n".join(heading + [f"[{timestamp(start)}–{timestamp(end)}] {text}\n" for start, end, text in paragraphs]),
+        encoding="utf-8",
+    )
+    print(f"Created:\n  {readable_path}\n  {raw_path}")
+
+
+if __name__ == "__main__":
+    main()
