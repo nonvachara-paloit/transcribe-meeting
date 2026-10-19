@@ -231,8 +231,8 @@ def main():
     parser.add_argument(
         "--engine",
         choices=("auto", "mlx", "faster-whisper", "crisperwhisper"),
-        default="auto",
-        help="auto = mlx-whisper on Apple silicon, faster-whisper (CPU) otherwise",
+        default="crisperwhisper",
+        help="transcription engine (default: crisperwhisper; auto selects mlx on Apple silicon, faster-whisper otherwise)",
     )
     args = parser.parse_args()
 
