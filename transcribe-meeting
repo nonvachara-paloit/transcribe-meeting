@@ -8,11 +8,13 @@ Usage:
   ./transcribe-meeting recording.mp3 --model small --output-dir ./transcripts
   ./transcribe-meeting recording.mp3 --engine faster-whisper
   ./transcribe-meeting recording.mp3 --engine crisperwhisper --model large
+  ./transcribe-meeting recording.mp3 --raw
 """
 
 import argparse
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -56,6 +58,58 @@ def missing_dependency(package):
 def timestamp(seconds):
     minutes, seconds = divmod(int(seconds), 60)
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def notify_transcription_finished(transcript_names):
+    title = "Transcription finished"
+    message = ", ".join(transcript_names)
+    if sys.platform == "darwin":
+        escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
+        escaped_message = message.replace("\\", "\\\\").replace('"', '\\"')
+        command = [
+            "osascript",
+            "-e",
+            f'display notification "{escaped_message}" with title "{escaped_title}"',
+        ]
+    elif sys.platform.startswith("linux"):
+        notify_send = shutil.which("notify-send")
+        if not notify_send:
+            print("Warning: --notify requires notify-send, but it was not found.", file=sys.stderr)
+            return
+        command = [notify_send, title, message]
+    else:
+        print(f"Warning: desktop notifications are not supported on {sys.platform}.", file=sys.stderr)
+        return
+
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+        print(f"Warning: could not send desktop notification: {detail}", file=sys.stderr)
+
+
+def audio_duration(audio):
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(audio),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise SystemExit("ffprobe is required to combine recordings (install ffmpeg).")
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"ffprobe failed to read {audio}:\n{error.stderr}")
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        raise SystemExit(f"Could not determine the duration of {audio}.")
 
 
 def mlx_repo(model):
@@ -216,9 +270,38 @@ def transcribe_crisperwhisper(args):
     return collected, f"Language: {args.language or 'auto'} (CrisperWhisper 2.0 {size}, verbatim)"
 
 
+def write_transcript(stem, collected, language_line, args):
+    raw_path = args.output_dir / f"{stem} transcript raw.md"
+    readable_path = args.output_dir / f"{stem} transcript.md"
+    heading = [f"{stem} — Meeting Transcript", language_line, ""]
+    if args.raw:
+        raw_path.write_text(
+            "\n".join(heading + [f"[{timestamp(start)}–{timestamp(end)}] {text}" for start, end, text in collected]) + "\n",
+            encoding="utf-8",
+        )
+
+    paragraphs, start, end, parts = [], None, None, []
+    for segment_start, segment_end, text in collected:
+        if start is None or segment_start - end > 3 or segment_end - start >= 35:
+            if parts:
+                paragraphs.append((start, end, " ".join(parts)))
+            start, parts = segment_start, []
+        end = segment_end
+        parts.append(text)
+    if parts:
+        paragraphs.append((start, end, " ".join(parts)))
+    readable_path.write_text(
+        "\n".join(heading + [f"[{timestamp(start)}–{timestamp(end)}] {text}\n" for start, end, text in paragraphs]),
+        encoding="utf-8",
+    )
+    print(f"Created:\n  {readable_path}")
+    if args.raw:
+        print(f"  {raw_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Transcribe a meeting recording locally.")
-    parser.add_argument("audio", type=Path, help="Audio or video recording to transcribe")
+    parser.add_argument("audio", type=Path, nargs="+", help="Audio or video recording(s) to transcribe")
     parser.add_argument(
         "--model",
         default=None,
@@ -228,6 +311,9 @@ def main():
     )
     parser.add_argument("--output-dir", type=Path, default=Path("."), help="Where transcripts are saved")
     parser.add_argument("--language", help="Optional language code, such as en")
+    parser.add_argument("--raw", action="store_true", help="Also create the raw, one-line-per-segment transcript")
+    parser.add_argument("--queue", action="store_true", help="Transcribe each recording as a separate meeting")
+    parser.add_argument("--notify", action="store_true", help="Send a desktop notification when transcription finishes")
     parser.add_argument(
         "--engine",
         choices=("auto", "mlx", "faster-whisper", "crisperwhisper"),
@@ -236,8 +322,10 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.audio.is_file():
-        parser.error(f"Recording not found: {args.audio}")
+    audio_files = args.audio
+    for audio in audio_files:
+        if not audio.is_file():
+            parser.error(f"Recording not found: {audio}")
 
     engine = args.engine
     if engine == "auto":
@@ -255,33 +343,35 @@ def main():
         "faster-whisper": transcribe_faster_whisper,
         "crisperwhisper": transcribe_crisperwhisper,
     }[engine]
-    collected, language_line = run(args)
-
-    stem = args.audio.stem
-    raw_path = args.output_dir / f"{stem} transcript.txt"
-    readable_path = args.output_dir / f"{stem} transcript - readable.txt"
-    heading = [f"{stem} — Meeting Transcript", language_line, ""]
-    raw_path.write_text(
-        "\n".join(heading + [f"[{timestamp(start)}–{timestamp(end)}] {text}" for start, end, text in collected]) + "\n",
-        encoding="utf-8",
-    )
-
-    paragraphs, start, end, parts = [], None, None, []
-    for segment_start, segment_end, text in collected:
-        if start is None or segment_start - end > 3 or segment_end - start >= 35:
-            if parts:
-                paragraphs.append((start, end, " ".join(parts)))
-            start, parts = segment_start, []
-        end = segment_end
-        parts.append(text)
-    if parts:
-        paragraphs.append((start, end, " ".join(parts)))
-    readable_path.write_text(
-        "\n".join(heading + [f"[{timestamp(start)}–{timestamp(end)}] {text}\n" for start, end, text in paragraphs]),
-        encoding="utf-8",
-    )
-    print(f"Created:\n  {readable_path}\n  {raw_path}")
+    combine = len(audio_files) > 1 and not args.queue
+    transcript_names = []
+    durations = [audio_duration(audio) for audio in audio_files] if combine else []
+    if combine:
+        collected, languages, offset = [], [], 0
+        for audio, duration in zip(audio_files, durations):
+            args.audio = audio
+            segments, language_line = run(args)
+            collected.extend((start + offset, end + offset, text) for start, end, text in segments)
+            if language_line not in languages:
+                languages.append(language_line)
+            offset += duration
+        language_line = "Languages: " + "; ".join(languages)
+        write_transcript("Combined", collected, language_line, args)
+        transcript_names.append("Combined transcript")
+    else:
+        name_counts = {}
+        for audio in audio_files:
+            args.audio = audio
+            collected, language_line = run(args)
+            name_counts[audio.stem] = name_counts.get(audio.stem, 0) + 1
+            stem = audio.stem
+            if name_counts[stem] > 1:
+                stem = f"{stem} ({name_counts[stem]})"
+            write_transcript(stem, collected, language_line, args)
+            transcript_names.append(f"{stem} transcript")
     print(f"Total time: {elapsed()}")
+    if args.notify:
+        notify_transcription_finished(transcript_names)
 
 
 if __name__ == "__main__":

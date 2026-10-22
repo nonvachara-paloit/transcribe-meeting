@@ -1,9 +1,10 @@
 # transcribe-meeting
 
-Local, offline meeting transcription. Produces two files per recording:
+Local, offline meeting transcription. Produces a readable transcript per recording:
 
-- `<name> transcript.txt` – one line per segment with `[mm:ss–mm:ss]` timestamps
-- `<name> transcript - readable.txt` – segments merged into paragraphs
+- `<name> transcript.md` – segments merged into paragraphs
+
+Use `--raw` to also create `<name> transcript raw.md`, with one line per segment and `[mm:ss–mm:ss]` timestamps.
 
 ## Engines
 
@@ -45,11 +46,17 @@ The script uses whichever Python is active. If you run it outside any virtualenv
 
 ```bash
 ./transcribe-meeting recording.m4a
+./transcribe-meeting part-1.m4a part-2.m4a
+./transcribe-meeting part-1.m4a part-2.m4a --queue
 ./transcribe-meeting recording.mp3 --model small --output-dir ./transcripts
 ./transcribe-meeting recording.mp3 --language en
 ./transcribe-meeting recording.mp3 --engine faster-whisper
 ./transcribe-meeting recording.mp3 --engine crisperwhisper --model turbo
+./transcribe-meeting recording.mp3 --raw
+./transcribe-meeting recording.mp3 --notify
 ```
+
+Multiple recordings are combined into one transcript by default, with timestamps continued from the duration of each preceding file. Use `--queue` to transcribe them sequentially as separate meetings, each with its own transcript. Combining multiple files requires `ffprobe` (included with ffmpeg) to read their durations.
 
 To run the script from any directory with its virtual environment, add this function to `~/.zshrc`. Replace `/path/to/transcribe-meeting` with the project directory:
 
@@ -67,6 +74,9 @@ transcribe-meeting() {
 | `--output-dir` | Where transcripts are written (default: current directory) |
 | `--language` | Language code such as `en`; auto-detected if omitted |
 | `--engine` | `auto` (default), `mlx`, `faster-whisper`, or `crisperwhisper` |
+| `--raw` | Also create the raw, one-line-per-segment transcript |
+| `--queue` | Keep multiple recordings as separate meetings instead of combining them |
+| `--notify` | Send one desktop notification after all transcripts are written (best-effort; macOS uses `osascript`, Linux requires `notify-send`) |
 
 Progress is shown on stderr while transcribing.
 
